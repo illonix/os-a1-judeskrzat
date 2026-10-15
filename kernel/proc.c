@@ -4,6 +4,7 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "uproc.h"
 #include "defs.h"
 
 struct cpu cpus[NCPU];
@@ -56,6 +57,59 @@ procinit(void)
     p->state = UNUSED;
     p->kstack = KSTACK((int)(p - proc));
   }
+}
+
+uint64
+count_processes(void)
+{
+  struct proc *p;
+  uint64 count = 0;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED)
+      count++;
+    release(&p->lock);
+  }
+  return count;
+}
+
+int
+copy_processes(uint64 user_addr, int max)
+{
+  struct proc *p;
+  struct proc *current = myproc();
+  int copied = 0;
+  uint64 dest = user_addr;
+
+  if (max < 0)
+    return -1;
+  for (p = proc; p < &proc[NPROC] && copied < max; p++) {
+    struct uproc info;
+
+    acquire(&wait_lock);
+    acquire(&p->lock);
+    if (p->state == UNUSED) {
+      release(&p->lock);
+      release(&wait_lock);
+      continue;
+    }
+    info.pid = p->pid;
+    info.ppid = p->parent ? p->parent->pid : 0;
+    info.state = p->state;
+    info.sz = p->sz;
+    safestrcpy(info.name, p->name, sizeof(info.name));
+    release(&p->lock);
+    release(&wait_lock);
+
+    if (dest + sizeof(info) < dest ||
+        copyout(current->pagetable, current->sz, dest, (char *)&info,
+                sizeof(info)) < 0)
+      return -1;
+    dest += sizeof(info);
+    copied++;
+  }
+  return copied;
 }
 
 // Must be called with interrupts disabled,
@@ -163,6 +217,7 @@ freeproc(struct proc *p)
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
+  p->trace_mask = 0;
   p->name[0] = 0;
   p->chan = 0;
   p->killed = 0;
@@ -277,6 +332,7 @@ kfork(void)
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+  np->trace_mask = p->trace_mask;
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
